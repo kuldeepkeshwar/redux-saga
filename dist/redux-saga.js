@@ -101,7 +101,6 @@ var ident = function ident(v) {
 
 function check(value, predicate, error) {
   if (!predicate(value)) {
-    log('error', 'uncaught at check', error);
     throw new Error(error);
   }
 }
@@ -110,6 +109,8 @@ var hasOwnProperty = Object.prototype.hasOwnProperty;
 function hasOwn(object, property) {
   return is.notUndef(object) && hasOwnProperty.call(object, property);
 }
+
+
 
 var is = {
   undef: function undef(v) {
@@ -525,29 +526,6 @@ var isEnd = function isEnd(a) {
   return a && a.type === CHANNEL_END_TYPE;
 };
 
-function emitter() {
-  var subscribers = [];
-
-  function subscribe(sub) {
-    subscribers.push(sub);
-    return function () {
-      return remove(subscribers, sub);
-    };
-  }
-
-  function emit(item) {
-    var arr = subscribers.slice();
-    for (var i = 0, len = arr.length; i < len; i++) {
-      arr[i](item);
-    }
-  }
-
-  return {
-    subscribe: subscribe,
-    emit: emit
-  };
-}
-
 var INVALID_BUFFER = 'invalid buffer passed to channel factory function';
 var UNDEFINED_INPUT_ERROR = 'Saga was provided with an undefined action';
 
@@ -565,7 +543,7 @@ function channel() {
 
   function checkForbiddenStates() {
     if (closed && takers.length) {
-      throw internalErr('Cannot have a closed channel with pending takers');
+      throw internalErr();
     }
     if (takers.length && !buffer.isEmpty()) {
       throw internalErr('Cannot have pending takers with non empty buffer');
@@ -662,6 +640,7 @@ function eventChannel(subscribe) {
     }
   };
   var unsubscribe = subscribe(function (input) {
+    //
     if (isEnd(input)) {
       close();
       return;
@@ -686,20 +665,65 @@ function eventChannel(subscribe) {
   };
 }
 
-function stdChannel(subscribe) {
-  var chan = eventChannel(function (cb) {
-    return subscribe(function (input) {
+function multicast() {
+  var chan = channel(buffers.none());
+  var putLock = false;
+  var pendingTakers = [];
+  return _extends({}, chan, {
+    put: function put(input) {
+      // TODO: should I check forbidden state here? 1 of them is even impossible
+      // as we do not possibility of buffer here
+      check(input, is.notUndef, UNDEFINED_INPUT_ERROR);
+      if (chan.__closed__) {
+        return;
+      }
+      var takers = chan.__takers__;
+      putLock = true;
+      for (var i = 0; i < takers.length; i++) {
+        var cb = takers[i];
+        if (!cb[MATCH] || cb[MATCH](input) || isEnd(input)) {
+          takers.splice(i, 1);
+          cb(input);
+          i--;
+        }
+      }
+      putLock = false;
+
+      pendingTakers.forEach(chan.take);
+      pendingTakers = [];
+    },
+    take: function take(cb) {
+      if (putLock) {
+        pendingTakers.push(cb);
+        cb.cancel = function () {
+          return remove(pendingTakers, cb);
+        };
+        return;
+      }
+      chan.take(cb);
+    }
+  });
+}
+
+function createStdChannel() {
+  var chan = multicast();
+  return _extends({}, chan, {
+    // TODO: how runSaga can benefit from this scheduling fix?
+    // maybe it should detect if passed channel is std and wrap with the fix if neccessary
+    // createStdChannel could be replaced with `stdChannel(multicast)`
+    // auto wrapping would mutate passed in reference though :/
+    put: function put(input) {
       if (input[SAGA_ACTION]) {
-        cb(input);
+        chan.put(input);
         return;
       }
       asap(function () {
-        return cb(input);
+        return chan.put(input);
       });
-    });
-  });
+    },
 
-  return _extends({}, chan, {
+    // TODO: rethink the matcher, seems hacky
+    // how matcher applies to runSaga now?
     take: function take(cb, matcher) {
       if (arguments.length > 1) {
         check(matcher, is.func, 'channel.take\'s matcher argument must be a function');
@@ -1297,10 +1321,7 @@ var wrapHelper = function wrapHelper(helper) {
   return { fn: helper };
 };
 
-function proc(iterator) {
-  var subscribe = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : function () {
-    return noop;
-  };
+function proc(iterator, stdChannel) {
   var dispatch = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : noop;
   var getState = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : noop;
   var parentContext = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : {};
@@ -1319,8 +1340,8 @@ function proc(iterator) {
       onError = options.onError;
 
   var log$$1 = logger || log;
-  var stdChannel$$1 = stdChannel(subscribe);
   var taskContext = Object.create(parentContext);
+
   /**
     Tracks the current effect cancellation
     Each time the generator progresses. calling runEffect will set a new value
@@ -1432,7 +1453,7 @@ function proc(iterator) {
       }
     } catch (error) {
       if (mainTask.isCancelled) {
-        log$$1('error', 'uncaught at ' + name, error.message);
+        log$$1('error', 'caught at ' + name, error.message);
       }
       mainTask.isMainRunning = false;
       mainTask.cont(error, true);
@@ -1441,7 +1462,12 @@ function proc(iterator) {
 
   function end(result, isErr) {
     iterator._isRunning = false;
-    stdChannel$$1.close();
+    // we cannot always close now, but should close only when root task ends
+    // or maybe even never as there might be multiple root tasks, even run dynamically
+    // only viable solution would be to close when whole middleware closes
+    // i.e. when END happens?
+
+    // stdChannel.close()
     if (!isErr) {
       if ("development" === 'development' && result === TASK_CANCEL) {
         log$$1('info', name + ' has been cancelled', '');
@@ -1453,9 +1479,11 @@ function proc(iterator) {
         result.sagaStack = 'at ' + name + ' \n ' + (result.sagaStack || result.stack);
       }
       if (!task.cont) {
-        log$$1('error', 'uncaught', result.sagaStack || result.stack);
         if (result instanceof Error && onError) {
           onError(result);
+        } else {
+          // TODO: could we skip this when _deferredEnd is attached?
+          log$$1('error', 'uncaught', result.sagaStack || result.stack);
         }
       }
       iterator._error = result;
@@ -1540,14 +1568,18 @@ function proc(iterator) {
       is.promise(effect) ? resolvePromise(effect, currCb) : is.helper(effect) ? runForkEffect(wrapHelper(effect), effectId, currCb) : is.iterator(effect) ? resolveIterator(effect, effectId, name, currCb)
 
       // declarative effects
-      : is.array(effect) ? runParallelEffect(effect, effectId, currCb) : (data = asEffect.take(effect)) ? runTakeEffect(data, currCb) : (data = asEffect.put(effect)) ? runPutEffect(data, currCb) : (data = asEffect.all(effect)) ? runAllEffect(data, effectId, currCb) : (data = asEffect.race(effect)) ? runRaceEffect(data, effectId, currCb) : (data = asEffect.call(effect)) ? runCallEffect(data, effectId, currCb) : (data = asEffect.cps(effect)) ? runCPSEffect(data, currCb) : (data = asEffect.fork(effect)) ? runForkEffect(data, effectId, currCb) : (data = asEffect.join(effect)) ? runJoinEffect(data, currCb) : (data = asEffect.cancel(effect)) ? runCancelEffect(data, currCb) : (data = asEffect.select(effect)) ? runSelectEffect(data, currCb) : (data = asEffect.actionChannel(effect)) ? runChannelEffect(data, currCb) : (data = asEffect.flush(effect)) ? runFlushEffect(data, currCb) : (data = asEffect.cancelled(effect)) ? runCancelledEffect(data, currCb) : (data = asEffect.getContext(effect)) ? runGetContextEffect(data, currCb) : (data = asEffect.setContext(effect)) ? runSetContextEffect(data, currCb) : /* anything else returned as is        */currCb(effect)
+      : is.array(effect) ? runParallelEffect(effect, effectId, currCb) : (data = asEffect.take(effect)) ? runTakeEffect(data, currCb) : (data = asEffect.put(effect)) ? runPutEffect(data, currCb) : (data = asEffect.all(effect)) ? runAllEffect(data, effectId, currCb) : (data = asEffect.race(effect)) ? runRaceEffect(data, effectId, currCb) : (data = asEffect.call(effect)) ? runCallEffect(data, effectId, currCb) : (data = asEffect.cps(effect)) ? runCPSEffect(data, currCb) : (data = asEffect.fork(effect)) ? runForkEffect(data, effectId, currCb) : (data = asEffect.join(effect)) ? runJoinEffect(data, currCb) : (data = asEffect.cancel(effect)) ? runCancelEffect(data, currCb) : (data = asEffect.select(effect)) ? runSelectEffect(data, currCb) : (data = asEffect.actionChannel(effect)) ? runChannelEffect(data, currCb) : (data = asEffect.flush(effect)) ? runFlushEffect(data, currCb) : (data = asEffect.cancelled(effect)) ? runCancelledEffect(data, currCb) : (data = asEffect.getContext(effect)) ? runGetContextEffect(data, currCb) : (data = asEffect.setContext(effect)) ? runSetContextEffect(data, currCb) : /* anything else returned as is */currCb(effect)
     );
   }
 
   function resolvePromise(promise, cb) {
     var cancelPromise = promise[CANCEL];
-    if (typeof cancelPromise === 'function') {
+    if (is.func(cancelPromise)) {
       cb.cancel = cancelPromise;
+    } else if (is.func(promise.abort)) {
+      cb.cancel = function () {
+        return promise.abort();
+      };
     }
     promise.then(cb, function (error) {
       return cb(error, true);
@@ -1555,7 +1587,7 @@ function proc(iterator) {
   }
 
   function resolveIterator(iterator, effectId, name, cb) {
-    proc(iterator, subscribe, dispatch, getState, taskContext, options, effectId, name, cb);
+    proc(iterator, stdChannel, dispatch, getState, taskContext, options, effectId, name, cb);
   }
 
   function runTakeEffect(_ref2, cb) {
@@ -1563,7 +1595,7 @@ function proc(iterator) {
         pattern = _ref2.pattern,
         maybe = _ref2.maybe;
 
-    channel$$1 = channel$$1 || stdChannel$$1;
+    channel$$1 = channel$$1 || stdChannel;
     var takeCb = function takeCb(inp) {
       return inp instanceof Error ? cb(inp, true) : isEnd(inp) && !maybe ? cb(CHANNEL_END) : cb(inp);
     };
@@ -1592,6 +1624,9 @@ function proc(iterator) {
       } catch (error) {
         // If we have a channel or `put.resolve` was used then bubble up the error.
         if (channel$$1 || resolve) return cb(error, true);
+        // TODO: error swallowing here is still a bis issue in the community
+        // final decision should be made - swallow or not?
+        // besides that - should such error here be passed to `onError`?
         log$$1('error', 'uncaught at ' + name, error.stack || error.message || error);
       }
 
@@ -1653,7 +1688,7 @@ function proc(iterator) {
 
     try {
       suspend();
-      var _task = proc(taskIterator, subscribe, dispatch, getState, taskContext, options, effectId, fn.name, detached ? null : noop);
+      var _task = proc(taskIterator, stdChannel, dispatch, getState, taskContext, options, effectId, fn.name, detached ? null : noop);
 
       if (detached) {
         cb(_task);
@@ -1807,9 +1842,16 @@ function proc(iterator) {
     var pattern = _ref8.pattern,
         buffer = _ref8.buffer;
 
+    var chan = channel(buffer);
     var match = matcher(pattern);
-    match.pattern = pattern;
-    cb(eventChannel(subscribe, buffer || buffers.fixed(), match));
+
+    var taker = function taker(action) {
+      stdChannel.take(taker, match);
+      chan.put(action);
+    };
+
+    stdChannel.take(taker, match);
+    cb(chan);
   }
 
   function runCancelledEffect(data, cb) {
@@ -1884,6 +1926,7 @@ function runSaga(storeInterface, saga) {
   }
 
   var _storeInterface = storeInterface,
+      channel$$1 = _storeInterface.channel,
       subscribe = _storeInterface.subscribe,
       dispatch = _storeInterface.dispatch,
       getState = _storeInterface.getState,
@@ -1906,7 +1949,14 @@ function runSaga(storeInterface, saga) {
     sagaMonitor.effectTriggered({ effectId: effectId, root: true, parentEffectId: 0, effect: { root: true, saga: saga, args: args } });
   }
 
-  var task = proc(iterator, subscribe, wrapSagaDispatch(dispatch), getState, context, { sagaMonitor: sagaMonitor, logger: logger, onError: onError }, effectId, saga.name);
+  var stdChannel = channel$$1 ? channel$$1 : function () {
+    var chan = createStdChannel();
+    // TODO: unsubscribe on close
+    subscribe(chan.put);
+    return chan;
+  }();
+
+  var task = proc(iterator, stdChannel, wrapSagaDispatch(dispatch), getState, context, { sagaMonitor: sagaMonitor, logger: logger, onError: onError }, effectId, saga.name);
 
   if (sagaMonitor) {
     sagaMonitor.effectResolved(effectId, task);
@@ -1952,12 +2002,13 @@ function sagaMiddlewareFactory() {
     var getState = _ref2.getState,
         dispatch = _ref2.dispatch;
 
-    var sagaEmitter = emitter();
-    sagaEmitter.emit = (options.emitter || ident)(sagaEmitter.emit);
+    var stdChannel = createStdChannel();
+    // how runSaga works with custom emitter?
+    stdChannel.put = (options.emitter || ident)(stdChannel.put);
 
     sagaMiddleware.run = runSaga.bind(null, {
       context: context,
-      subscribe: sagaEmitter.subscribe,
+      channel: stdChannel,
       dispatch: dispatch,
       getState: getState,
       sagaMonitor: sagaMonitor,
@@ -1971,7 +2022,7 @@ function sagaMiddlewareFactory() {
           sagaMonitor.actionDispatched(action);
         }
         var result = next(action); // hit reducers
-        sagaEmitter.emit(action);
+        stdChannel.put(action);
         return result;
       };
     };

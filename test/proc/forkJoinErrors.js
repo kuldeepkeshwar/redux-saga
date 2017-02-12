@@ -51,7 +51,7 @@ test('proc sync fork failures: functions/error bubbling', assert => {
 
   // NOTE: we'll be forking a function not a Generator
   function immediatelyFailingFork() {
-    throw 'immediatelyFailingFork'
+    throw new Error('immediatelyFailingFork')
   }
 
   function* genParent() {
@@ -61,7 +61,7 @@ test('proc sync fork failures: functions/error bubbling', assert => {
       actual.push('success parent')
     }
     catch (e) {
-      actual.push('parent caught ' + e)
+      actual.push('parent caught ' + e.message)
     }
   }
 
@@ -71,12 +71,12 @@ test('proc sync fork failures: functions/error bubbling', assert => {
       yield io.fork(genParent)
       actual.push('success main')
     } catch(e) {
-      actual.push('main caught ' + e)
+      actual.push('main caught ' + e.message)
     }
   }
 
   proc(main()).done.catch(err => {
-    actual.push('uncaught ' + err)
+    actual.push('uncaught ' + err.message)
   })
 
 
@@ -135,7 +135,7 @@ test('proc sync fork failures: spawns (detached forks)', assert => {
   let actual = []
 
   function* genChild() {
-    throw 'gen error'
+    throw new Error('gen error')
   }
 
   function* main() {
@@ -146,7 +146,7 @@ test('proc sync fork failures: spawns (detached forks)', assert => {
       actual.push('success parent')
     }
     catch (e) {
-      actual.push('main caught ' + e)
+      actual.push('main caught ' + e.message)
     }
   }
 
@@ -158,6 +158,4 @@ test('proc sync fork failures: spawns (detached forks)', assert => {
     assert.deepEqual(actual, expected,"proc should not fail a parent with errors from detached forks (spawn)")
     assert.end()
   }, 0)
-
-
 });

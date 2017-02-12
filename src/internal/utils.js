@@ -14,7 +14,6 @@ export const ident = v => v
 
 export function check(value, predicate, error) {
   if(!predicate(value)) {
-    log('error', 'uncaught at check', error)
     throw new Error(error)
   }
 }
@@ -22,6 +21,11 @@ export function check(value, predicate, error) {
 const hasOwnProperty = Object.prototype.hasOwnProperty
 export function hasOwn(object, property) {
   return is.notUndef(object) && hasOwnProperty.call(object, property)
+}
+
+export const once = fn => {
+  let cached
+  return (...args) => cached || (cached = fn(...args))
 }
 
 export const is = {

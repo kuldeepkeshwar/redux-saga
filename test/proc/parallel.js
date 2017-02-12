@@ -1,4 +1,6 @@
 import test from 'tape';
+import { createStore, applyMiddleware } from 'redux'
+import sagaMiddleware from '../../src'
 import { END } from '../../src'
 import proc from '../../src/internal/proc'
 import { deferred, arrayOfDeffered } from '../../src/utils'
@@ -13,13 +15,9 @@ test('processor array of effects handling', assert => {
   let cpsCb = {}
   const cps = (val, cb) => cpsCb = {val, cb}
 
-  const input = cb => {
-    Promise.resolve(1)
-      .then(() => def.resolve(1))
-      .then(() => cpsCb.cb(null, cpsCb.val))
-      .then(() => cb({type: 'action'}))
-    return () => {}
-  }
+
+  const middleware = sagaMiddleware()
+  const store = applyMiddleware(middleware)(createStore)(() => {})
 
   function* genFn() {
     actual = yield io.all([
@@ -29,16 +27,23 @@ test('processor array of effects handling', assert => {
     ])
   }
 
-  proc(genFn(), input).done.catch(err => assert.fail(err))
+  const task = middleware.run(genFn)
+
+  Promise.resolve(1)
+    .then(() => def.resolve(1))
+    .then(() => cpsCb.cb(null, cpsCb.val))
+    .then(() => store.dispatch({ type: 'action' }))
 
   const expected = [1,2, {type: 'action'}];
 
-  setTimeout(() => {
-    assert.deepEqual(actual, expected,
-      "processor must fullfill parallel effects"
-    );
-    assert.end();
-  })
+  task.done
+    .then(() => {
+      assert.deepEqual(actual, expected,
+        "processor must fullfill parallel effects"
+      );
+      assert.end();
+    })
+    .catch(err => assert.fail(err))
 
 });
 
@@ -107,15 +112,9 @@ test('processor array of effect: handling END', assert => {
 
   let actual;
   const def = deferred()
-  const input = (cb) => {
-    Promise.resolve(1)
-      .then(() => def.resolve(1))
-      .then(() => cb(END))
 
-    return () => {}
-  }
-
-
+  const middleware = sagaMiddleware()
+  const store = applyMiddleware(middleware)(createStore)(() => {})
 
   function* genFn() {
     try {
@@ -126,18 +125,22 @@ test('processor array of effect: handling END', assert => {
     } finally {
       actual = 'end'
     }
-
   }
 
-  proc(genFn(), input).done.catch(err => assert.fail(err))
+  const task = middleware.run(genFn)
 
-  setTimeout(() => {
-    assert.deepEqual(actual, 'end',
-      "processor must end Parallel Effect if one of the effects resolve with END"
-    );
-    assert.end();
-  })
+  Promise.resolve(1)
+    .then(() => def.resolve(1))
+    .then(() => store.dispatch(END))
 
+  task.done
+    .then(() => {
+      assert.deepEqual(actual, 'end',
+        "processor must end Parallel Effect if one of the effects resolve with END"
+      );
+      assert.end();
+    })
+    .catch(err => assert.fail(err))
 });
 
 test('processor array of effect: named effects', assert => {
@@ -145,13 +148,9 @@ test('processor array of effect: named effects', assert => {
 
   let actual;
   const def = deferred()
-  const input = (cb) => {
-    Promise.resolve(1)
-      .then(() => def.resolve(1))
-      .then(() => cb({ type: 'action' }))
 
-    return () => {}
-  }
+  const middleware = sagaMiddleware()
+  const store = applyMiddleware(middleware)(createStore)(() => {})
 
   function* genFn() {
     actual = yield io.all({
@@ -160,14 +159,20 @@ test('processor array of effect: named effects', assert => {
     })
   }
 
-  proc(genFn(), input).done.catch(err => assert.fail(err))
+  const task = middleware.run(genFn)
 
-  setTimeout(() => {
-    const expected = { ac: { type: 'action' }, prom: 1 }
-    assert.deepEqual(actual, expected,
-      "processor must handle parallel named effects"
-    );
-    assert.end();
-  })
+  Promise.resolve(1)
+      .then(() => def.resolve(1))
+      .then(() => store.dispatch({ type: 'action' }))
 
+  const expected = { ac: { type: 'action' }, prom: 1 }
+
+  task.done
+    .then(() => {
+      assert.deepEqual(actual, expected,
+        "processor must handle parallel named effects"
+      );
+      assert.end();
+    })
+    .catch(err => assert.fail(err))
 });

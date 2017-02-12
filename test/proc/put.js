@@ -3,9 +3,8 @@ import { createStore, applyMiddleware } from 'redux'
 import proc from '../../src/internal/proc'
 import * as io from '../../src/effects'
 import * as utils from '../../src/internal/utils'
-import {emitter, channel} from '../../src/internal/channel'
+import {createStdChannel, channel} from '../../src/internal/channel'
 import sagaMiddleware from '../../src'
-
 
 test('proc put handling', assert => {
   assert.plan(1)
@@ -18,7 +17,7 @@ test('proc put handling', assert => {
     yield io.put(2)
   }
 
-  proc(genFn('arg'), undefined, dispatch).done.catch(err => assert.fail(err))
+  proc(genFn('arg'), createStdChannel(), dispatch).done.catch(err => assert.fail(err))
 
   const expected = ['arg', 2];
   setTimeout(() => {
@@ -69,7 +68,7 @@ test('proc async put\'s response handling', assert => {
     actual.push(yield io.put.resolve(2))
   }
 
-  proc(genFn('arg'), undefined, dispatch).done.catch(err => assert.fail(err))
+  proc(genFn('arg'), createStdChannel(), dispatch).done.catch(err => assert.fail(err))
 
   const expected = ['arg', 2];
   setTimeout(() => {
@@ -85,18 +84,18 @@ test('proc error put\'s response handling', assert => {
   assert.plan(1)
 
   let actual = []
-  const dispatch = v => { throw 'error ' + v }
+  const dispatch = v => { throw new Error('error ' + v) }
 
   function* genFn(arg) {
     try {
       yield io.put(arg)
       actual.push('put resume')
     } catch(err) {
-      actual.push(err)
+      actual.push(err.message)
     }
   }
 
-  proc(genFn('arg'), undefined, dispatch).done.catch(err => assert.fail(err))
+  proc(genFn('arg'), createStdChannel(), dispatch).done.catch(err => assert.fail(err))
 
   const expected = ['put resume'];
   setTimeout(() => {
@@ -105,7 +104,6 @@ test('proc error put\'s response handling', assert => {
     );
     assert.end();
   })
-
 });
 
 test('proc error put.resolve\'s response handling', assert => {
@@ -122,7 +120,7 @@ test('proc error put.resolve\'s response handling', assert => {
     }
   }
 
-  proc(genFn('arg'), undefined, dispatch).done.catch(err => assert.fail(err))
+  proc(genFn('arg'), createStdChannel(), dispatch).done.catch(err => assert.fail(err))
 
   const expected = ['error arg'];
   setTimeout(() => {
@@ -138,7 +136,8 @@ test('proc nested puts handling', assert => {
   assert.plan(1)
 
   let actual = []
-  const em = emitter()
+  const middleware = sagaMiddleware()
+  applyMiddleware(middleware)(createStore)(() => {})
 
   function* genA() {
     yield io.put({type: 'a'})
@@ -151,13 +150,12 @@ test('proc nested puts handling', assert => {
     actual.push('put b')
   }
 
-
   function* root() {
     yield io.fork(genB) // forks genB first to be ready to take before genA starts putting
     yield io.fork(genA)
   }
 
-  proc(root(), em.subscribe, em.emit).done.catch(err => assert.fail(err))
+  middleware.run(root).done.catch(err => assert.fail(err))
 
   const expected = ['put a', 'put b'];
   setTimeout(() => {
@@ -178,7 +176,7 @@ test('puts emitted while dispatching saga need not to cause stack overflow', ass
   assert.plan(1);
   const reducer = (state, action) => action.type
   const middleware = sagaMiddleware({
-    emitter: emit => action => {
+    emitter: emit => () => {
       for (var i = 0; i < 32768; i++) {
         emit({type: 'test'});
       }

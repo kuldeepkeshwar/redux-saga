@@ -1,6 +1,7 @@
 /* eslint-disable no-constant-condition */
-
 import test from 'tape';
+import { createStore, applyMiddleware } from 'redux'
+import sagaMiddleware from '../../src'
 import proc from '../../src/internal/proc'
 import * as io from '../../src/effects'
 import { deferred, arrayOfDeffered } from '../../src/utils'
@@ -156,13 +157,8 @@ test('proc cancellation: take effect', assert => {
   let startDef = deferred()
   let cancelDef = deferred()
 
-  const input = cb => {
-    Promise.resolve(1)
-      .then(() => startDef.resolve('start'))
-      .then(() => cancelDef.resolve('cancel'))
-      .then(() => cb({type: 'action'}))
-    return () => {}
-  }
+  const middleware = sagaMiddleware()
+  const store = applyMiddleware(middleware)(createStore)(() => {})
 
   function* main() {
     actual.push(yield startDef.promise)
@@ -174,21 +170,28 @@ test('proc cancellation: take effect', assert => {
     }
   }
 
-  const task = proc(main(), input)
+  const task = middleware.run(main)
+
   cancelDef.promise.then(v => {
     actual.push(v)
     task.cancel()
   })
-  task.done.catch(err => assert.fail(err))
+
+  Promise.resolve(1)
+    .then(() => startDef.resolve('start'))
+    .then(() => cancelDef.resolve('cancel'))
+    .then(() => store.dispatch({type: 'action'}))
 
   const expected = ['start', 'cancel', 'cancelled'];
 
-  setTimeout(() => {
-    assert.deepEqual(actual, expected,
-      "cancelled take effect must stop waiting for action"
-    );
-    assert.end();
-  })
+  task.done
+    .then(() => {
+      assert.deepEqual(actual, expected,
+        "cancelled take effect must stop waiting for action"
+      );
+      assert.end();
+    })
+    .catch(err => assert.fail(err))
 })
 
 test('proc cancellation: join effect (joining from a different task)', assert => {

@@ -1,8 +1,7 @@
 import { noop, kTrue, is, log as _log, check, deferred, uid as nextEffectId, array, remove, object, TASK, CANCEL, SELF_CANCELLATION, makeIterator, createSetContextWarning, deprecate, updateIncentive } from './utils'
 import { asap, suspend, flush } from './scheduler'
 import { asEffect } from './io'
-import { stdChannel as _stdChannel, eventChannel, isEnd } from './channel'
-import { buffers } from './buffers'
+import { channel, isEnd } from './channel'
 
 export const NOT_ITERATOR_ERROR = 'proc first argument (Saga function result) must be an iterator'
 
@@ -136,7 +135,7 @@ const wrapHelper = (helper) => ({ fn: helper })
 
 export default function proc(
   iterator,
-  subscribe = () => noop,
+  stdChannel, // TODO: create from noop in runSaga
   dispatch = noop,
   getState = noop,
   parentContext = {},
@@ -152,8 +151,8 @@ export default function proc(
 
   const {sagaMonitor, logger, onError} = options
   const log = logger || _log
-  const stdChannel = _stdChannel(subscribe)
   const taskContext = Object.create(parentContext)
+
   /**
     Tracks the current effect cancellation
     Each time the generator progresses. calling runEffect will set a new value
@@ -268,7 +267,7 @@ export default function proc(
       }
     } catch(error) {
       if(mainTask.isCancelled) {
-        log('error', `uncaught at ${name}`, error.message)
+        log('error', `caught at ${name}`, error.message)
       }
       mainTask.isMainRunning = false
       mainTask.cont(error, true)
@@ -277,7 +276,12 @@ export default function proc(
 
   function end(result, isErr) {
     iterator._isRunning = false
-    stdChannel.close()
+    // we cannot always close now, but should close only when root task ends
+    // or maybe even never as there might be multiple root tasks, even run dynamically
+    // only viable solution would be to close when whole middleware closes
+    // i.e. when END happens?
+
+    // stdChannel.close()
     if(!isErr) {
       if(process.env.NODE_ENV === 'development' && result === TASK_CANCEL) {
         log('info', `${name} has been cancelled`, '')
@@ -289,9 +293,11 @@ export default function proc(
         result.sagaStack = `at ${name} \n ${result.sagaStack || result.stack}`
       }
       if(!task.cont) {
-        log('error', `uncaught`, result.sagaStack || result.stack)
         if((result instanceof Error) && onError) {
           onError(result)
+        } else {
+          // TODO: could we skip this when _deferredEnd is attached?
+          log('error', `uncaught`, result.sagaStack || result.stack)
         }
       }
       iterator._error = result
@@ -319,7 +325,6 @@ export default function proc(
       if(effectSettled) {
         return
       }
-
 
       effectSettled = true
       cb.cancel = noop // defensive measure
@@ -395,7 +400,7 @@ export default function proc(
       : (data = asEffect.cancelled(effect))     ? runCancelledEffect(data, currCb)
       : (data = asEffect.getContext(effect))    ? runGetContextEffect(data, currCb)
       : (data = asEffect.setContext(effect))    ? runSetContextEffect(data, currCb)
-      : /* anything else returned as is        */              currCb(effect)
+      : /* anything else returned as is */        currCb(effect)
     )
   }
 
@@ -405,8 +410,6 @@ export default function proc(
       cb.cancel = cancelPromise
     } else if(is.func(promise.abort))  {
       cb.cancel = () => promise.abort()
-      // TODO: add support for the fetch API, whenever they get around to
-      // adding cancel support
     }
     promise.then(
       cb,
@@ -415,7 +418,7 @@ export default function proc(
   }
 
   function resolveIterator(iterator, effectId, name, cb) {
-    proc(iterator, subscribe, dispatch, getState, taskContext, options, effectId, name, cb)
+    proc(iterator, stdChannel, dispatch, getState, taskContext, options, effectId, name, cb)
   }
 
   function runTakeEffect({channel, pattern, maybe}, cb) {
@@ -446,6 +449,9 @@ export default function proc(
       } catch(error) {
         // If we have a channel or `put.resolve` was used then bubble up the error.
         if (channel || resolve) return cb(error, true)
+        // TODO: error swallowing here is still a bis issue in the community
+        // final decision should be made - swallow or not?
+        // besides that - should such error here be passed to `onError`?
         log('error', `uncaught at ${name}`, error.stack || error.message || error)
       }
 
@@ -496,7 +502,7 @@ export default function proc(
       suspend()
       const task = proc(
         taskIterator,
-        subscribe,
+        stdChannel,
         dispatch,
         getState,
         taskContext,
@@ -642,9 +648,16 @@ export default function proc(
   }
 
   function runChannelEffect({pattern, buffer}, cb) {
+    const chan = channel(buffer)
     const match = matcher(pattern)
-    match.pattern = pattern
-    cb(eventChannel(subscribe, buffer || buffers.fixed(), match))
+
+    const taker = action => {
+      stdChannel.take(taker, match)
+      chan.put(action)
+    }
+
+    stdChannel.take(taker, match)
+    cb(chan)
   }
 
   function runCancelledEffect(data, cb) {
